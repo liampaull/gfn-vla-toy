@@ -14,8 +14,10 @@ discrete action-token DAG, replace the discrete-diffusion decoder objective with
 * decoders compared on the same DAG of partial token assignments:
   discrete diffusion (masked CE on 85/15 left-biased demos, random or confidence order) vs. GFlowNet
   (trajectory balance on a compositional simulator reward, fixed or learned order with a learned backward policy);
-* metrics: success, clean success, collisions, wrong target, mode coverage (left/right detours), decoding-order maps,
-  parallel-decoding degradation.
+* fairness baselines: discrete diffusion on 200k demos (matched data), best-of-8 under the simulator reward at
+  inference, and GRPO-style policy-gradient fine-tuning of the diffusion model with the same reward and budget;
+* metrics: success, clean success, collisions, wrong target, mode coverage (left/right detours), sample diversity,
+  decoding-order maps, parallel-decoding degradation.
 
 `gfn_vla_toy.py` is the same content with `# %%` cell markers (easier to diff / edit); rebuild the notebook from it with
 any py-to-ipynb converter (jupytext, or the small nbformat script used here).
@@ -28,5 +30,5 @@ PATH=.venv/bin:$PATH jupyter-lab gfn_vla_toy.ipynb          # interactive
 PATH=.venv/bin:$PATH jupyter-nbconvert --to notebook --execute --inplace gfn_vla_toy.ipynb   # headless
 ```
 
-Device is picked automatically (`cuda` > `mps` > `cpu`). Whole notebook: ~10 min on Apple-silicon / GPU,
-~35 min on CPU (the `FAST` flag halves the GFlowNet budget there).
+Device is picked automatically (`cuda` > `mps` > `cpu`). Whole notebook: ~15 min on Apple-silicon / GPU,
+~50 min on CPU (the `FAST` flag halves the GFlowNet budget there).

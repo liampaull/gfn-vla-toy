@@ -36,7 +36,9 @@
 # > Caveat up front: this is a testbed, not a result. Both decoders are small and trained for a few thousand
 # > steps, so absolute success rates are modest and differ from seed to seed; what the notebook is built to
 # > show is the *mechanism* (same DAG, different objective, different mode coverage) and the knobs you would
-# > turn in a real VLA (reward terms, replay, generation order, parallel decoding).
+# > turn in a real VLA (reward terms, replay, generation order, parallel decoding). Section 8 adds the baselines
+# > that make the comparison fair (matched data, reward at inference, RL fine-tuning on the same reward), and
+# > section 13 summarises what they show.
 
 # %%
 import math, os, time
@@ -63,6 +65,9 @@ N_ITERS_BACKBONE, N_ITERS_DD, N_ITERS_GFN = 2000, 3000, (1500 if FAST else 3000)
 COL = {
     "DD / random": "#2a78d6",
     "DD / confidence": "#eb6834",
+    "DD / 200k demos": "#eda100",
+    "DD / best-of-8": "#e87ba4",
+    "DD + PG": "#e34948",
     "GFN / fixed": "#1baf7a",
     "GFN / learned": "#4a3aa7",
     "fail": "#9a9a94",
@@ -272,23 +277,29 @@ def plan_demo(start, obstacle, goal, rng, p_left=0.85, margin=0.08):
 
 
 def make_demos(n, rng, p_left=0.85):
+    """Clean, successful demonstrations as a dict of numpy arrays (scene geometry, instruction, 'tok').
+    Images are rendered per batch at training time, so large demo sets stay small in memory."""
     sc = sample_scenes(n, rng)
     toks, sides = zip(*[plan_demo(sc["start"][i], sc["obstacle"][i], sc["goal"][i], rng, p_left) for i in range(n)])
-    toks = torch.as_tensor(np.stack(toks), device=DEVICE)
-    sc_t = to_torch(sc)
-    e = simulate(toks, sc_t)
-    keep = e["clean"].cpu().numpy()
-    sc_keep = {k: v[keep] for k, v in sc.items()}
-    sc_keep_t = to_torch(sc_keep)
-    sc_keep_t["tok"] = toks[torch.as_tensor(keep, device=DEVICE)]
+    toks, sides = np.stack(toks), np.array(sides)
+    geo = {k: torch.as_tensor(v, device=DEVICE) for k, v in sc.items()}          # simulate() needs no image
+    keep = simulate(torch.as_tensor(toks, device=DEVICE), geo)["clean"].cpu().numpy()
+    demos = {k: v[keep] for k, v in sc.items()}
+    demos["tok"] = toks[keep]
     print(f"demos: kept {keep.sum()}/{n} clean successes "
-          f"({keep.mean():.1%}); left-detour fraction = {(np.array(sides)[keep] < 0).mean():.2f}")
-    return sc_keep_t
+          f"({keep.mean():.1%}); left-detour fraction = {(sides[keep] < 0).mean():.2f}")
+    return demos
+
+
+def demo_batch(demos, idx):
+    """Render and move a subset of a demo set to the device."""
+    return to_torch({k: v[idx] for k, v in demos.items()})
 
 
 rng = np.random.default_rng(SEED)
 DEMOS = make_demos(6000, rng)
 N_DEMOS = DEMOS["tok"].shape[0]
+DEMOS_T = demo_batch(DEMOS, np.arange(N_DEMOS))       # the 6k set rendered once: used for plotting and GFN replay
 
 # %%
 def draw_scene(ax, sc, i, title=None):
@@ -309,11 +320,11 @@ def draw_scene(ax, sc, i, title=None):
 
 fig, axes = plt.subplots(2, 4, figsize=(11, 5.6))
 for j in range(4):
-    img = DEMOS["img"][j].cpu().numpy().transpose(1, 2, 0)
+    img = DEMOS_T["img"][j].cpu().numpy().transpose(1, 2, 0)
     axes[0, j].imshow(img); axes[0, j].set_xticks([]); axes[0, j].set_yticks([]); axes[0, j].grid(False)
-    axes[0, j].set_title(f'"{decode_instruction(DEMOS["lang"][j].tolist())}"', fontsize=9)
-    draw_scene(axes[1, j], DEMOS, j, title="demonstration chunk")
-    p = simulate(DEMOS["tok"][j:j + 1], {k: v[j:j + 1] for k, v in DEMOS.items()})["pos"][0].cpu().numpy()
+    axes[0, j].set_title(f'"{decode_instruction(DEMOS_T["lang"][j].tolist())}"', fontsize=9)
+    draw_scene(axes[1, j], DEMOS_T, j, title="demonstration chunk")
+    p = simulate(DEMOS_T["tok"][j:j + 1], {k: v[j:j + 1] for k, v in DEMOS_T.items()})["pos"][0].cpu().numpy()
     axes[1, j].plot(p[:, 0], p[:, 1], "-o", ms=3, lw=1.5, color=COL["demo"])
 axes[0, 0].set_ylabel("what the VLA sees (32x32)")
 axes[1, 0].set_ylabel("simulator view")
@@ -487,14 +498,15 @@ def dd_sample(model, ctx, order="random", n_steps=None):
     return x, reveal_step
 
 
-def train_dd(model, n_iters=3000, batch=128, lr=3e-4, log_every=250):
+def train_dd(model, demos=DEMOS, n_iters=3000, batch=128, lr=3e-4, log_every=250, seed=2):
+    rng = np.random.default_rng(seed)
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, n_iters)
     hist, t0 = [], time.time()
     for it in range(1, n_iters + 1):
-        idx = torch.randint(0, N_DEMOS, (batch,), device=DEVICE)
-        ctx = model.embed_context(DEMOS["img"][idx], DEMOS["lang"][idx])
-        loss = dd_loss(model, ctx, DEMOS["tok"][idx])
+        sc = demo_batch(demos, rng.integers(0, demos["tok"].shape[0], batch))
+        ctx = model.embed_context(sc["img"], sc["lang"])
+        loss = dd_loss(model, ctx, sc["tok"])
         opt.zero_grad(); loss.backward()
         nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         opt.step(); sched.step()
@@ -553,10 +565,11 @@ def gfn_sample(model, ctx, learned_order=True, eps=0.0):
 LOG_PB_TRAJ = -math.lgamma(L + 1)       # sum_t log P_B = -log(L!) for the uniform backward policy
 
 
-def tb_loss(model, ctx, states, positions, values, logR, learned_order, order_coef=0.0):
-    """Trajectory balance. `states` are s_0..s_{L-1}; the terminal chunk s_L is rebuilt from the last transition.
-    Fixed order: P(pos) and P_B uniform (both constants). Learned order: P(pos) from the select head and P_B from
-    the unreveal head, evaluated on the *next* state."""
+def policy_terms(model, ctx, states, positions, values, learned_order):
+    """Per-step log-probabilities along a trajectory, recomputed in one batched pass. `states` are s_0..s_{L-1};
+    the terminal chunk s_L is rebuilt from the last transition. Fixed order: P(pos) and P_B uniform (both
+    constants). Learned order: P(pos) from the select head and P_B from the unreveal head (on the *next* state).
+    Returns log Z(c), log P(pos_t), log P(val_t | pos_t), log P_B(s_t | s_{t+1}), each (B,) or (B, L)."""
     B = states.shape[0]
     ar = torch.arange(B, device=states.device)
     x = states[:, -1].clone()
@@ -576,11 +589,17 @@ def tb_loss(model, ctx, states, positions, values, logR, learned_order, order_co
         logp_back = -torch.log(revealed_next.sum(-1).float())              # uniform over revealed positions
     vl_sel = vl.gather(2, positions.view(B, L, 1, 1).expand(-1, -1, 1, K)).squeeze(2)
     logp_val = F.log_softmax(vl_sel, -1).gather(-1, values.unsqueeze(-1)).squeeze(-1)
+    return logZ, logp_pos, logp_val, logp_back
+
+
+def tb_loss(model, ctx, states, positions, values, logR, learned_order, order_coef=0.0):
+    """Trajectory balance: (log Z + sum log P_F - log R - sum log P_B)^2."""
+    logZ, logp_pos, logp_val, logp_back = policy_terms(model, ctx, states, positions, values, learned_order)
     resid = logZ + (logp_pos + logp_val).sum(1) - logR - logp_back.sum(1)
     loss = resid.pow(2).mean()
     if learned_order and order_coef > 0:
         # Optional auxiliary signal for the order policy: TB itself has no preference between reveal orders (see
-        # section 10), so reinforce orders along which the current model is most self-consistent (small residual).
+        # section 11), so reinforce orders along which the current model is most self-consistent (small residual).
         r2 = resid.pow(2).detach()
         loss = loss + order_coef * (((r2 - r2.mean()) / (r2.std() + 1e-6)) * logp_pos.sum(1)).mean()
     return loss
@@ -648,7 +667,7 @@ def train_gfn(model, learned_order, n_iters=3000, batch=64, lr=2e-3, lr_logZ=1e-
     buf, demo_buf = Replay(), None
     if use_demos:
         demo_buf = Replay()
-        demo_buf.add(DEMOS, DEMOS["tok"], log_reward(DEMOS["tok"], DEMOS))
+        demo_buf.add(DEMOS_T, DEMOS_T["tok"], log_reward(DEMOS_T["tok"], DEMOS_T))
     hist, t0 = {"loss": [], "logR": [], "success": [], "clean": []}, time.time()
     for it in range(1, n_iters + 1):
         # (1) on-policy trajectories on fresh scenes, with eps-uniform exploration that decays to zero
@@ -701,7 +720,73 @@ axes[2].set_title("GFN: clean-success rate of training samples"); axes[2].set_xl
 plt.tight_layout(); plt.show()
 
 # %% [markdown]
-# ## 8. Evaluation on held-out scenes
+# ## 8. Fairer baselines: matched data, reward at inference, RL fine-tuning
+#
+# The comparison above is an ablation of the *objective* on a fixed DAG, but it is not a fair fight: the GFlowNet
+# gets a simulator with ground-truth geometry, a dense reward, and ~200k fresh scenes, whereas discrete diffusion
+# sees 6000 fixed demonstrations. Three baselines pull those factors apart:
+#
+# 1. **`DD / 200k demos`**: the same masked-CE decoder trained on a demonstration set as large as the number of
+#    scenes the GFlowNet queried (isolates data volume).
+# 2. **`DD / best-of-8`**: the 6k-demo DD model, but each returned chunk is the best of 8 samples under the
+#    simulator reward (reward access at inference only, no training change).
+# 3. **`DD + PG`**: the 6k-demo DD model fine-tuned with a GRPO-style policy gradient on the *same* reward, the
+#    same simulator, and the same on-policy sample budget as the GFlowNet (8 samples per scene, group-normalised
+#    log-reward advantages, gradient through the log-probability of the sampled random-order trajectory). This is
+#    the real competitor: it has everything the GFlowNet has, and differs only in what it optimises, expected
+#    reward rather than reward-proportional sampling.
+
+# %%
+DEMOS_200K = make_demos(200_000, np.random.default_rng(SEED + 1))
+dd_200k = fresh_model()
+dd_200k_hist = train_dd(dd_200k, demos=DEMOS_200K, n_iters=N_ITERS_DD)
+
+
+def best_of_n(sampler, n=8):
+    """Wrap a sampler: draw n chunks per scene and keep the one with the highest simulator reward."""
+    def wrapped(sc):
+        rep = {k: v.repeat_interleave(n, 0) for k, v in sc.items()}
+        x, order = sampler(rep)
+        best = log_reward(x, rep).view(-1, n).argmax(1)
+        idx = torch.arange(best.shape[0], device=x.device) * n + best
+        return x[idx], order[idx]
+    return wrapped
+
+
+def train_pg(model, n_iters=3000, batch=64, group=8, lr=3e-4, log_every=250, seed=3):
+    """GRPO-style policy-gradient fine-tuning on whole chunks with the same reward and sampler as the GFlowNet."""
+    rng = np.random.default_rng(seed)
+    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.0)
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, n_iters)
+    hist, t0 = {"logR": [], "success": [], "clean": []}, time.time()
+    for it in range(1, n_iters + 1):
+        sc = to_torch({k: np.repeat(v, group, axis=0) for k, v in sample_scenes(batch // group, rng).items()})
+        ctx = model.embed_context(sc["img"], sc["lang"])
+        x, states, positions, values, _ = gfn_sample(model, ctx.detach(), learned_order=False, eps=0.0)
+        logR = log_reward(x, sc)
+        r = logR.view(-1, group)
+        adv = ((r - r.mean(1, keepdim=True)) / (r.std(1, keepdim=True) + 1e-6)).view(-1)
+        log_pi = policy_terms(model, ctx, states, positions, values, learned_order=False)[2].sum(1)
+        loss = -(adv.detach() * log_pi).mean()
+        opt.zero_grad(); loss.backward()
+        nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        opt.step(); sched.step()
+        e = simulate(x, sc)
+        hist["logR"].append(logR.mean().item())
+        hist["success"].append(e["success"].float().mean().item()); hist["clean"].append(e["clean"].float().mean().item())
+        if it % log_every == 0:
+            m = lambda k: np.mean(hist[k][-log_every:])
+            print(f"[DD + PG] it {it:5d}  logR {m('logR'):6.2f}  on-policy success {m('success'):.2f}  "
+                  f"clean {m('clean'):.2f}  ({time.time() - t0:.0f}s)")
+    return hist
+
+
+import copy
+dd_pg = copy.deepcopy(dd_model)
+dd_pg_hist = train_pg(dd_pg, n_iters=N_ITERS_GFN)
+
+# %% [markdown]
+# ## 9. Evaluation on held-out scenes
 #
 # For each of 200 held-out scenes we draw 16 chunks per decoder and report:
 #
@@ -742,11 +827,22 @@ def evaluate(sampler, sc=EVAL_SC, n_samples=EVAL_SAMPLES, chunk=800):
     return metrics, dict(tok=tok, order=order, **e)
 
 
+def dd_sampler(model, order="random"):
+    return lambda sc: dd_sample(model, model.embed_context(sc["img"], sc["lang"]), order=order)
+
+
+def gfn_sampler(model, learned_order):
+    return lambda sc: (lambda r: (r[0], r[4]))(gfn_sample(model, model.embed_context(sc["img"], sc["lang"]), learned_order=learned_order))
+
+
 SAMPLERS = {
-    "DD / random":     lambda sc: dd_sample(dd_model, dd_model.embed_context(sc["img"], sc["lang"]), order="random"),
-    "DD / confidence": lambda sc: dd_sample(dd_model, dd_model.embed_context(sc["img"], sc["lang"]), order="confidence"),
-    "GFN / fixed":     lambda sc: (lambda r: (r[0], r[4]))(gfn_sample(gfn_fixed, gfn_fixed.embed_context(sc["img"], sc["lang"]), learned_order=False)),
-    "GFN / learned":   lambda sc: (lambda r: (r[0], r[4]))(gfn_sample(gfn_learned, gfn_learned.embed_context(sc["img"], sc["lang"]), learned_order=True)),
+    "DD / random":      dd_sampler(dd_model, "random"),
+    "DD / confidence":  dd_sampler(dd_model, "confidence"),
+    "DD / 200k demos":  dd_sampler(dd_200k, "random"),
+    "DD / best-of-8":   best_of_n(dd_sampler(dd_model, "random"), n=8),
+    "DD + PG":          dd_sampler(dd_pg, "random"),
+    "GFN / fixed":      gfn_sampler(gfn_fixed, learned_order=False),
+    "GFN / learned":    gfn_sampler(gfn_learned, learned_order=True),
 }
 RESULTS, RAW = {}, {}
 for name, sampler in SAMPLERS.items():
@@ -756,9 +852,10 @@ cols = ["success", "clean", "collision", "wrong_target", "both_modes", "left_fra
 print(f"{'decoder':18s}" + "".join(f"{c:>13s}" for c in cols))
 for name, m in RESULTS.items():
     print(f"{name:18s}" + "".join(f"{m[c]:13.3f}" for c in cols))
+print("\n(DD / best-of-8 and DD + PG use the simulator reward; DD / 200k demos matches the GFlowNet's scene budget)")
 
 # %%
-fig, axes = plt.subplots(1, 3, figsize=(12, 3.4))
+fig, axes = plt.subplots(1, 4, figsize=(18, 3.6))
 names = list(RESULTS)
 for ax, keys, title in [(axes[0], ["success", "clean"], "task success"),
                         (axes[1], ["collision", "wrong_target"], "failure modes"),
@@ -770,21 +867,29 @@ for ax, keys, title in [(axes[0], ["success", "clean"], "task success"),
                       alpha=1.0 if j == 0 else 0.45, edgecolor="white", linewidth=1)
         for b, v in zip(bars, vals):
             ax.text(b.get_x() + b.get_width() / 2, v + 0.01, f"{v:.2f}", ha="center", va="bottom", fontsize=7, color="#52514e")
-    ax.set_xticks(np.arange(len(names))); ax.set_xticklabels(names, rotation=20, ha="right", fontsize=8)
+    ax.set_xticks(np.arange(len(names))); ax.set_xticklabels(names, rotation=30, ha="right", fontsize=7)
     ax.set_ylim(0, 1.12); ax.set_title(title + f"  (solid: {keys[0]}, light: {keys[1]})", fontsize=9)
+ax = axes[3]
+vals = [RESULTS[n]["distinct"] for n in names]
+bars = ax.bar(np.arange(len(names)), vals, 0.6, color=[COL[n] for n in names], edgecolor="white", linewidth=1)
+for b, v in zip(bars, vals):
+    ax.text(b.get_x() + b.get_width() / 2, v + 0.01, f"{v:.2f}", ha="center", va="bottom", fontsize=7, color="#52514e")
+ax.set_xticks(np.arange(len(names))); ax.set_xticklabels(names, rotation=30, ha="right", fontsize=7)
+ax.set_ylim(0, 1.12); ax.set_title("diversity (distinct chunks among 16 samples)", fontsize=9)
 plt.tight_layout(); plt.show()
 
 # %% [markdown]
-# ## 9. What the decoders sample
+# ## 10. What the decoders sample
 #
 # Each panel overlays the 16 sampled chunks for one held-out scene: coloured paths are clean successes, grey
 # paths fail (collision, wrong target, or short of the goal).
 
 # %%
 show = [0, 1, 2, 3]
-fig, axes = plt.subplots(len(show), len(names), figsize=(2.6 * len(names), 2.6 * len(show)))
+show_names = ["DD / random", "DD / 200k demos", "DD + PG", "GFN / fixed", "GFN / learned"]
+fig, axes = plt.subplots(len(show), len(show_names), figsize=(2.6 * len(show_names), 2.6 * len(show)))
 for r, s in enumerate(show):
-    for c, name in enumerate(names):
+    for c, name in enumerate(show_names):
         ax = axes[r, c]
         draw_scene(ax, EVAL_SC_NP, s, title=name if r == 0 else None)
         sl = slice(s * EVAL_SAMPLES, (s + 1) * EVAL_SAMPLES)
@@ -796,7 +901,7 @@ for r, s in enumerate(show):
 plt.tight_layout(); plt.show()
 
 # %% [markdown]
-# ## 10. Generation order: heuristic vs learned
+# ## 11. Generation order: heuristic vs learned
 #
 # Mean reveal step of each action token (row = chunk step `t`, column = `dx`/`dy`), averaged over all
 # evaluation samples, and the entropy of the position choice at each decoding step.
@@ -811,7 +916,7 @@ plt.tight_layout(); plt.show()
 # order to prefer. `train_gfn(..., order_coef=0.1)` adds a REINFORCE-style term that favours orders with small TB
 # residual (an amortised cousin of the entropy heuristic); at this scale it is too noisy to break the symmetry
 # either. A criterion in which the order genuinely matters, e.g. block-parallel reveals where tokens revealed
-# together are sampled independently, is the natural next experiment (see section 12).
+# together are sampled independently, is the natural next experiment (see section 13).
 
 # %%
 fig, axes = plt.subplots(1, 3, figsize=(9.5, 3.4))
@@ -847,7 +952,7 @@ plt.plot(range(L), ents, color=COL["GFN / learned"], lw=1.5, label="learned orde
 plt.xlabel("decoding step"); plt.ylabel("entropy of P(position)"); plt.legend(); plt.tight_layout(); plt.show()
 
 # %% [markdown]
-# ## 11. Parallel decoding
+# ## 12. Parallel decoding
 #
 # Discrete-diffusion VLAs reveal several tokens per step for latency. Revealing tokens in parallel samples them
 # *independently* given the current state, which can mix action modes inside one chunk. The same parallel
@@ -876,7 +981,7 @@ plt.xscale("log", base=2); plt.xticks(steps_grid, steps_grid); plt.xlabel("decod
 plt.ylabel("clean success"); plt.ylim(0, 1); plt.legend(); plt.tight_layout(); plt.show()
 
 # %% [markdown]
-# ## 12. Notes from building this, and where to go from here
+# ## 13. Notes from building this, and where to go from here
 #
 # **What to expect from the numbers.** Across the runs used to build this notebook (3000 GFlowNet iterations),
 # the GFlowNet decoders reached ~45-60% success with ~17-30% collisions, versus ~35-40% success and ~35%
@@ -885,8 +990,23 @@ plt.ylabel("clean success"); plt.ylim(0, 1); plt.legend(); plt.tight_layout(); p
 # the DD baseline essentially never executes a clean right-hand detour, while the GFlowNet recovered both
 # detours in anywhere between ~10% and ~35% of held-out scenes depending on the run, with the left/right split
 # drifting from the demo bias towards 50/50 as training continues. The learned order did not differ from the
-# random order (see section 10). Longer GFlowNet training (the TB loss is still far from zero at 3000
+# random order (see section 11). Longer GFlowNet training (the TB loss is still far from zero at 3000
 # iterations) keeps improving success and mode balance.
+#
+# **What the fairer baselines say (section 8).**
+# * *Data volume is not what holds imitation back.* 200k demonstrations give the same ~33% success as 6k: the
+#   masked-CE decoder is limited by how precisely it can reproduce a fragile token pattern from pixels, not by data.
+# * *Reward access at inference is the strongest single ingredient.* Best-of-8 under the simulator reward lifts the
+#   6k-demo DD model to ~84% success with ~2% collisions, far above every trained decoder here, but it still never
+#   leaves the demonstrated mode and it needs eight simulator rollouts per action chunk.
+# * *Policy-gradient fine-tuning beats the GFlowNet on success, and collapses.* With the same reward, simulator and
+#   on-policy budget, GRPO-style fine-tuning reaches ~58% clean success and ~7% collisions, better than TB's
+#   ~40-53% and ~17-19%. The price is diversity: only ~40% of its 16 samples per scene are distinct chunks (the
+#   GFlowNets: 100%), and it executes exactly one detour. This is the trade-off the proposal predicts, reward
+#   maximisation versus reward-proportional sampling, and it is what the GFlowNet buys at this scale: not higher
+#   success, but a decoder whose samples are a distribution rather than a point. Whether that matters is a question
+#   about the downstream use (human selection among proposals, exploration for further learning, robustness to a
+#   mis-specified reward), not something this toy can settle.
 #
 # **Things that mattered.**
 # * *Backbone grounding.* Without the grounding pre-training, neither decoder learns to pick the instructed
@@ -910,7 +1030,7 @@ plt.ylabel("clean success"); plt.ylim(0, 1); plt.legend(); plt.tight_layout(); p
 # * **Parallel decoding and learned order, together.** Redefine the DAG so that an edge reveals a *block* of
 #   tokens sampled independently; TB applies unchanged with a backward policy over blocks. In that DAG the order
 #   is no longer a free choice: grouping conditionally dependent tokens (the two sides of a detour) into one block
-#   breaks balance, so the order policy gets a real training signal, which is exactly what section 10 found to be
+#   breaks balance, so the order policy gets a real training signal, which is exactly what section 11 found to be
 #   missing in the one-token-per-step DAG. Sub-trajectory balance (a flow head per state) is a drop-in alternative
 #   to TB on either DAG.
 # * **Scaling up.** Replace `ToyVLA` by a real VLM backbone with an action-token vocabulary (OpenVLA-style
